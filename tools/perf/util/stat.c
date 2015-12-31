@@ -20,6 +20,70 @@ void update_stats(struct stats *stats, u64 val)
 		stats->min = val;
 }
 
+u64 perf_evsel_run_avg(struct perf_evsel *evsel, u64 current)
+{
+	u64 val = 0;
+	u32 i, j, index;
+
+	/*
+	 * Slide the window by 1 and calculate the sum of the last
+	 * size-1  counter  values.
+	 * fifoout is the current position of the window.
+	 * Increment the fifoout by 1 to slide the window by 1.
+	 * Calcalute the sum from ++fifoout  to ( ++fifoout + size -1)
+	 * e.g.fifoout =1;   val1 val2 ..... valn are the
+	 * sliding window values where n is size of the sliding window
+	* bandwidth sum:  sum  =  val2 + val3 + .. valn
+*/
+	if (evsel->index++ >= evsel->runavg_nosamples) {
+		index =  evsel->fifoout;
+		for (i = 0; i <  evsel->runavg_nosamples - 1;) {
+			if ((index + i) >=  evsel->runavg_nosamples)
+				j = index + i - evsel->runavg_nosamples;
+			else
+				j = index + i;
+			val += evsel->fifo[j];
+			i++;
+		}
+
+		evsel->run_avg = (val + current) / evsel->runavg_nosamples;
+		if (++evsel->fifoout ==  evsel->runavg_nosamples)
+			evsel->fifoout =  0;
+	} else
+		evsel->run_avg = (evsel->run_avg * (evsel->index - 1) +
+				  current) / evsel->index;
+
+	/*
+	 * store current sample's counter value in sliding window at the
+	 * location fifoin. Increment fifoin. Check if fifoin has reached
+	 * size. If yes reset it to beginninng i.e. zero
+	 */
+
+	evsel->fifo[evsel->fifoin] = current;
+	if (++evsel->fifoin == evsel->runavg_nosamples)
+		evsel->fifoin = 0;
+
+	return evsel->run_avg;
+}
+
+int perf_evsel__alloc_rafifo(struct perf_evsel *evsel)
+{
+	if (evsel->runavg_nosamples) {
+		evsel->fifo = zalloc(sizeof(u64) * evsel->runavg_nosamples);
+		if (evsel->fifo == NULL)
+			return -ENOMEM;
+		evsel->fifoin = 0;
+		evsel->fifoout = 0;
+		evsel->index = 0;
+	}
+	return 0;
+}
+
+void perf_evsel__free_rafifo(struct perf_evsel *evsel)
+{
+	free(evsel->fifo);
+}
+
 double avg_stats(struct stats *stats)
 {
 	return stats->mean;
@@ -160,6 +224,8 @@ int perf_evlist__alloc_stats(struct perf_evlist *evlist, bool alloc_raw)
 	evlist__for_each(evlist, evsel) {
 		if (perf_evsel__alloc_stats(evsel, alloc_raw))
 			goto out_free;
+		if (perf_evsel__alloc_rafifo(evsel))
+			goto out_free;
 	}
 
 	return 0;
@@ -177,6 +243,7 @@ void perf_evlist__free_stats(struct perf_evlist *evlist)
 		perf_evsel__free_stat_priv(evsel);
 		perf_evsel__free_counts(evsel);
 		perf_evsel__free_prev_raw_counts(evsel);
+		perf_evsel__free_rafifo(evsel);
 	}
 }
 

@@ -13,8 +13,50 @@
 #define MSR_IA32_QM_CTR		0x0c8e
 #define MSR_IA32_QM_EVTSEL	0x0c8d
 
+/*
+ * MBM Counter is 24bits wide. MBM_CNTR_MAX defines max counter
+ * value
+ */
+#define MBM_CNTR_MAX		0xffffff
+
+/*
+ *  Maximum number of MBM event types supported
+ */
+#define MAX_MBM_EVENT_TYPES 1
+/*
+ * Expected time interval in ms between consecutive MSR reads for a given rmid
+ */
+#define MBM_TIME_DELTA_EXP	1000
+
+/*
+ *  Minimum time interval in ms between consecutive MSR reads for a given rmid
+ */
+#define MBM_TIME_DELTA_MIN	(100 * MAX_MBM_EVENT_TYPES)
+
+/*
+ * Minimum size for sliding window i.e. the minimum monitoring period for
+ * application(s). This fifo_size can be used for short duration monitoring
+ * since short duration monitoring will have less number of samples.
+ * Corresponding sliding window duration will be 10sec. mbm_window_size
+ * variable is used to set the current monitoring duration.
+ */
+#define MBM_FIFO_SIZE_MIN	10
+/*
+ * Maximum size for sliding window i.e. the maximum monitoring period that is
+ * supported. Corresponsing sliding window  duration for this fifo_size is
+ * 300sec. Typically long duration monitoring session can use this window size.
+ */
+#define MBM_FIFO_SIZE_MAX	300
+/*
+ * mbm_window_size is used to set current monitoring period. This means
+ * mbm_window_size defines the number of profiled samples to be stored in
+ * sliding window i.e. mbm_fifo.
+ */
+static u32 mbm_window_size = MBM_FIFO_SIZE_MIN;
 static u32 cqm_max_rmid = -1;
 static unsigned int cqm_l3_scale; /* supposedly cacheline size */
+static bool cqm_llc_occ, is_mbm;
+static u16  mbm_socket_max;
 
 /**
  * struct intel_pqr_state - State cache for the PQR MSR
@@ -42,6 +84,67 @@ struct intel_pqr_state {
  * interrupts disabled, which is sufficient for the protection.
  */
 static DEFINE_PER_CPU(struct intel_pqr_state, pqr_state);
+static DEFINE_PER_CPU(struct mbm_pmu *, mbm_pmu);
+
+/**
+ * struct mbm_pmu - mbm events per cpu
+ * @n_active:       number of active events for this pmu
+ * @active_list:    linked list for perf events for this pmu
+ * @pmu:            pmu per cpu
+ * @timer_interval: pmu's hrtimer period
+ * @hrtimer:        periodic high resolution timer for this pmu
+ *                  intel_mbm_event_update is the callback function that gets
+ *                  triggered by hrtimer and profiles for a new mbm sample.
+ */
+struct mbm_pmu {
+	int              n_active;
+	struct list_head active_list;
+	struct pmu       *pmu;
+	ktime_t          timer_interval;
+	struct hrtimer   hrtimer;
+};
+
+/**
+ * struct sample - mbm event's (local or total) data
+ * @bytes:         previous MSR value
+ * @runavg:        running average of memory bandwidth
+ * @prev_time:     time stamp of previous sample i.e. {bytes, runavg}
+ * @index:         current sample number
+ * @fifoin:        sliding window counter to store the sample
+ * @fifoout:       start of the sliding window to calculate  bandwidh sum
+ */
+struct sample {
+	u64 bytes;
+	u64 runavg;
+	ktime_t prev_time;
+	u32 index;
+	u32 mbmfifo[MBM_FIFO_SIZE_MAX];
+	u32  fifoin;
+	u32  fifoout;
+};
+
+/*
+ * samples profiled for total memory bandwidth type events
+ */
+static struct sample *mbm_total;
+
+/*
+ * samples profiled for local memory bandwidth type events
+ */
+static struct sample *mbm_local;
+
+#define pkg_id	topology_physical_package_id(smp_processor_id())
+/*
+ * rmid_2_index returns the index for the rmid in mbm_local/mbm_total array.
+ * mbm_total[] and mbm_local[] are linearly indexed by core# * max number of
+ * rmids per socket, an example is given below
+ * RMID1 of Socket0:  vrmid  = 1
+ * RMID1 of Socket1:  vrmid =  1 * cqm_max_rmid + 1
+ * RMID1 of Socket2:  vrmid =  2 * cqm_max_rmid + 1
+ */
+#define rmid_2_index(rmid)  (pkg_id * cqm_max_rmid + rmid)
+
+static enum hrtimer_restart mbm_hrtimer_handle(struct hrtimer *hrtimer);
 
 /*
  * Protects cache_cgroups and cqm_rmid_free_lru and cqm_rmid_limbo_lru.
@@ -65,9 +168,20 @@ static cpumask_t cqm_cpumask;
 #define RMID_VAL_ERROR		(1ULL << 63)
 #define RMID_VAL_UNAVAIL	(1ULL << 62)
 
-#define QOS_L3_OCCUP_EVENT_ID	(1 << 0)
+#define QOS_L3_OCCUP_EVENT_ID	0x01
+/*
+ * MBM Event IDs as defined in SDM section 17.15.5
+ * Event IDs are used to program EVTSEL MSRs before reading mbm event counters
+ */
+enum mbm_evt_type {
+	QOS_MBM_TOTAL_EVENT_ID = 0x02,
+	QOS_MBM_LOCAL_EVENT_ID,
+	QOS_MBM_TOTAL_AVG_EVENT_ID,
+	QOS_MBM_LOCAL_AVG_EVENT_ID,
+};
 
-#define QOS_EVENT_MASK	QOS_L3_OCCUP_EVENT_ID
+#define QOS_MBM_AVG_EVENT_MASK 0x04
+#define QOS_MBM_LOCAL_EVENT_MASK 0x01
 
 /*
  * This is central to the rotation algorithm in __intel_cqm_rmid_rotate().
@@ -125,7 +239,11 @@ struct cqm_rmid_entry {
 	enum rmid_recycle_state state;
 	struct list_head list;
 	unsigned long queue_time;
+	bool is_cqm;
+	bool is_multi_event;
 };
+
+static void intel_cqm_free_rmid(struct cqm_rmid_entry *entry);
 
 /*
  * cqm_rmid_free_lru - A least recently used list of RMIDs.
@@ -176,6 +294,33 @@ static inline struct cqm_rmid_entry *__rmid_entry(u32 rmid)
 	return entry;
 }
 
+/**
+ * mbm_reset_stats - reset stats for a given rmid for the current cpu
+ * @rmid:	rmid value
+ *
+ * vrmid: array index for mbm_total or mbm_local of the current core for the
+ * given rmid
+ *
+ * mbs_total[] and mbm_local[] are linearly indexed by core number * max number
+ * rmids per socket, an example is given below
+ * RMID1 of Socket0:  vrmid  = 1
+ * RMID1 of Socket1:  vrmid =  1 * CQM_MAX_RMID + 1
+ * RMID1 of Socket2:  vrmid =  2 * CQM_MAX_RMID + 1
+ */
+static void mbm_reset_stats(u32 rmid)
+{
+	u32  i, vrmid;
+
+	if (!is_mbm)
+		return;
+	for (i=0; i < mbm_socket_max; i++) {
+		vrmid =  i * cqm_max_rmid + rmid;
+		memset(&mbm_local[vrmid], 0, sizeof(struct sample));
+		memset(&mbm_total[vrmid], 0, sizeof(struct sample));
+	}
+
+}
+
 /*
  * Returns < 0 on fail.
  *
@@ -207,8 +352,18 @@ static void __put_rmid(u32 rmid)
 
 	entry->queue_time = jiffies;
 	entry->state = RMID_YOUNG;
+	mbm_reset_stats(rmid);
 
-	list_add_tail(&entry->list, &cqm_rmid_limbo_lru);
+	/*
+	 * If the RMID is used for measuring LLC_OCCUPANCY, put it in
+	 * cqm_rmid_limbo_lru so that it gets recycled. Otherwise, RMID
+	 * is put in free list and is immediately available for reuse
+	 */
+	if (entry->is_cqm)
+		list_add_tail(&entry->list, &cqm_rmid_limbo_lru);
+	else
+		intel_cqm_free_rmid(entry);
+
 }
 
 static int intel_cqm_setup_rmid_cache(void)
@@ -232,6 +387,7 @@ static int intel_cqm_setup_rmid_cache(void)
 
 		INIT_LIST_HEAD(&entry->list);
 		entry->rmid = r;
+		entry->is_cqm = false;
 		cqm_rmid_ptrs[r] = entry;
 
 		list_add_tail(&entry->list, &cqm_rmid_free_lru);
@@ -282,8 +438,15 @@ static bool __match_event(struct perf_event *a, struct perf_event *b)
 	/*
 	 * Events that target same task are placed into the same cache group.
 	 */
-	if (a->hw.target == b->hw.target)
+	if (a->hw.target == b->hw.target) {
+		if (a->attr.config  != b->attr.config) {
+			struct cqm_rmid_entry *entry;
+
+				entry = __rmid_entry(a->hw.cqm_rmid);
+				entry->is_multi_event = true;
+		}
 		return true;
+	}
 
 	/*
 	 * Are we an inherited event?
@@ -393,6 +556,7 @@ static bool __conflict_event(struct perf_event *a, struct perf_event *b)
 struct rmid_read {
 	u32 rmid;
 	atomic64_t value;
+	enum mbm_evt_type evt_type;
 };
 
 static void __intel_cqm_event_count(void *info);
@@ -494,6 +658,256 @@ static bool intel_cqm_sched_in_event(u32 rmid)
 	return false;
 }
 
+static void intel_cqm_free_rmid(struct cqm_rmid_entry *entry)
+{
+	/*
+	 * The rotation RMID gets priority if it's currently invalid.
+	 *
+	 * In which case, skip adding the RMID to the the free lru.
+	 */
+	 if (!__rmid_valid(intel_cqm_rotation_rmid)) {
+		intel_cqm_rotation_rmid = entry->rmid;
+		return;
+	}
+
+	/*
+	 * If we have groups waiting for RMIDs, hand them one now
+	 * provided they don't conflict.
+	 */
+	if (intel_cqm_sched_in_event(entry->rmid))
+		return;
+
+	/*
+	 * Otherwise place it onto the free list.
+	 */
+	list_add_tail(&entry->list, &cqm_rmid_free_lru);
+}
+
+/*
+ * Slide the window by 1 and calculate the sum of the last
+ * mbm_window_size-1  bandwidth  values.
+ * fifoout is the current position of the window.
+ * Increment the fifoout by 1 to slide the window by 1.
+ *
+ * Calcalute the bandwidth from ++fifiout  to ( ++fifoout + mbm_window_size -1)
+ * e.g.fifoout =1;   Bandwidth1 Bandwidth2 ..... Bandwidthn are the
+ * sliding window values where n is size of the sliding window
+ * bandwidth sum:  val  =  Bandwidth2 + Bandwidth3 + .. Bandwidthn
+ */
+
+static u32 __mbm_fifo_sum_lastn_out(struct sample *bw_stat)
+{
+	u32 val = 0, i, j, index;
+
+	if (++bw_stat->fifoout >=  mbm_window_size)
+		bw_stat->fifoout =  0;
+	index =  bw_stat->fifoout;
+	for (i = 0; i < mbm_window_size - 1; i++) {
+		if ((index + i) >= mbm_window_size)
+			j = index + i - mbm_window_size;
+		else
+			j = index + i;
+		val += bw_stat->mbmfifo[j];
+	}
+	return val;
+}
+
+/*
+ * store current sample's bw value in sliding window at the
+ * location fifoin. Increment fifoin. Check if fifoin has reached
+ * max_window_size. If yes reset it to beginning i.e. zero
+ *
+ */
+static void mbm_fifo_in(struct sample *bw_stat, u32 val)
+{
+	bw_stat->mbmfifo[bw_stat->fifoin] = val;
+	if (++bw_stat->fifoin == mbm_window_size)
+		bw_stat->fifoin = 0;
+}
+
+/*
+ * rmid_read_mbm checks whether it is LOCAL or Total MBM event and reads
+ * its MSR counter. Check whether overflow occurred and handle it. Calculate
+ * current bandwidth and updates its running average.
+ *
+ * MBM Counter Overflow:
+ * Calculation of Current Bandwidth value:
+ * If MSR is read within last 100ms, then we rturn the previous value
+ * Currently perf receommends keeping 100ms between samples. Driver uses
+ * this guideline. If the MSR was Read with in last 100ms, why  incur an
+ * extra overhead of doing the MSR reads again.
+ *
+ * Bandwidth is calculated as:
+ * memory bandwidth = (difference of  two msr counter values )/time difference
+ *
+ * cum_avg = Running Average of bandwidth with last 'n' bandwidth values of
+ * the samples that are processed
+ *
+ * Sliding window is used to save the last 'n' samples. Where,
+ * n = sliding_window_size and results in sliding window duration of 'n' secs.
+ * The sliding window size by default set to
+ * MBM_FIFO_SIZE_MIN. User can configure it to the values in the range
+ * (MBM_FIFO_SIZE_MIN,MBM_FIFO_SIZE_MAX). The range for sliding window
+ * is chosen based on a general criteria for monitoring duration. Example
+ * for a short lived application, 10sec monitoring period gives
+ * good characterization of its bandwidth consumption. For an application
+ * that runs for longer duration, 300sec monitoring period gives better
+ * characterization of its bandwidth consumption. Since the running average
+ * calculated for total monitoring period, user gets the most accurate
+ * average bandwidth for each monitoring period.
+ *
+ * Conversion from Bytes/sec to MB/sec:
+ * current sample's  bandwidth is calculated in Bytes/sec.
+ * Perf user space gets the values in units as specified by .scale and .unit
+ * atrributes for the MBM event.
+ */
+static u64 rmid_read_mbm(unsigned int rmid, enum mbm_evt_type evt_type)
+{
+	u64  val, currentmsr, diff_time,  currentbw, bytes, prevavg;
+	bool overflow = false, first = false;
+	ktime_t cur_time;
+	u32 eventid, index;
+	struct sample *mbm_current;
+	u32 vrmid = rmid_2_index(rmid);
+
+	cur_time = ktime_get();
+	if (evt_type & QOS_MBM_LOCAL_EVENT_MASK) {
+		mbm_current = &mbm_local[vrmid];
+		eventid     =  QOS_MBM_LOCAL_EVENT_ID;
+	} else {
+		mbm_current = &mbm_total[vrmid];
+		eventid     = QOS_MBM_TOTAL_EVENT_ID;
+	}
+
+	prevavg = mbm_current->runavg;
+	if (mbm_current->fifoin > 0)
+		currentbw = mbm_current->mbmfifo[mbm_current->fifoin-1];
+	else
+		currentbw = prevavg;
+	diff_time = ktime_ms_delta(cur_time,
+				   mbm_current->prev_time);
+	if (diff_time > MBM_TIME_DELTA_MIN) {
+
+		wrmsr(MSR_IA32_QM_EVTSEL, eventid, rmid);
+		rdmsrl(MSR_IA32_QM_CTR, val);
+
+		if (val & (RMID_VAL_ERROR | RMID_VAL_UNAVAIL))
+			return val;
+
+		bytes = mbm_current->bytes;
+		currentmsr = val;
+		val &= MBM_CNTR_MAX;
+		/* if MSR current read value is less than MSR previous read
+		 * value then it is an overflow. MSR values are increasing
+		 * when bandwidth consumption for the thread is non-zero;
+		 * Overflow occurs, When MBM counter value reaches its
+		 * maximum i.e. MBM_CNTR_MAX.
+		 *
+		 * After overflow, MSR current value goes back to zero and
+		 * starts increasing again at the rate of bandwidth.
+		 *
+		 * Overflow handling:
+		 * First overflow is detected by comparing current msr values
+		 * will with the last read value. If current msr value is less
+		 * than previous value then it is an overflow. When overflow
+		 * occurs, (MBM_CONTR_MAX - prev msr value) is added the current
+		 * msr value to the get actual value.
+		 */
+
+		if (val < bytes) {
+			val = MBM_CNTR_MAX - bytes + val + 1;
+			overflow = true;
+		} else
+			val = val - bytes;
+
+		/*
+		 * MBM_TIME_DELTA_EXP is picked as per MBM specs. As per
+		 * hardware functionality, overflow can occur maximum once in a
+		 * second. So latest we want to read the MSR counters is 1000ms.
+		 * Minimum time interval between two MSR reads is 100ms. If
+		 * read_rmid_mbm is called with in less than 100ms, use the
+		 * previous sammple since perf also recommends to use the
+		 * minimum sampling period of 100ms.
+		 */
+
+		if ((diff_time > MBM_TIME_DELTA_EXP) && (!prevavg))
+		/* First sample, we can't use the time delta */
+			first = true;
+
+		if ((diff_time <= (MBM_TIME_DELTA_EXP + MBM_TIME_DELTA_MIN))  ||
+			   overflow || first) {
+			int averagebw, bwsum;
+
+			/*
+			 * For the first 'mbm_window_size -1' samples
+			 * calculate average by adding the current sample's
+			 * bandwidth to the sum of existing bandwidth values and
+			 * dividing the sum with the #samples profiled so far
+			*/
+			averagebw = 0;
+			index = mbm_current->index;
+			currentbw =  (val * MSEC_PER_SEC) / diff_time;
+			averagebw = currentbw;
+			if (index    && (index < mbm_window_size)) {
+				averagebw = prevavg  + currentbw / index -
+				    prevavg / index;
+			} else  if (index >= mbm_window_size) {
+				/*
+				 * Compute the sum of bandwidth for recent n-1
+				 * sampland slide the window by 1
+				 */
+				bwsum = __mbm_fifo_sum_lastn_out(mbm_current);
+				/*
+				 * recalculate the running average by adding
+				 * current bandwidth  and
+				 * __mbm_fifo_sum_lastn_out which is the sum of
+				 * last bandwidth values from the sliding
+				 * window. The sum divided by mbm_window_size'
+				 * is the new running average of the MBM
+				 * Bandwidth
+				 */
+				averagebw = (bwsum + currentbw) /
+					     mbm_window_size;
+			}
+
+			/* save the current sample's bandwidth in fifo */
+			mbm_fifo_in(mbm_current, currentbw);
+			mbm_current->index++;
+			mbm_current->runavg = averagebw;
+			mbm_current->bytes = currentmsr;
+			mbm_current->prev_time = cur_time;
+
+		}
+	}
+	/* No change, return the existing running average */
+	if (evt_type & QOS_MBM_AVG_EVENT_MASK)
+		return mbm_current->runavg;
+	else
+		return currentbw;
+}
+
+static void intel_mbm_event_update(struct perf_event *event)
+{
+	unsigned int rmid;
+	u64 val = 0;
+
+	/*
+	 * Task events are handled by intel_cqm_event_count().
+	 */
+
+	rmid = event->hw.cqm_rmid;
+	if (!__rmid_valid(rmid))
+		return;
+	val = rmid_read_mbm(rmid, event->attr.config);
+	/*
+	 * Ignore this reading on error states and do not update the value.
+	 */
+	if (val & (RMID_VAL_ERROR | RMID_VAL_UNAVAIL))
+		return;
+
+	local64_set(&event->count, val);
+}
+
 /*
  * Initially use this constant for both the limbo queue time and the
  * rotation timer interval, pmu::hrtimer_interval_ms.
@@ -581,28 +995,7 @@ static bool intel_cqm_rmid_stabilize(unsigned int *available)
 			continue;
 
 		list_del(&entry->list);	/* remove from limbo */
-
-		/*
-		 * The rotation RMID gets priority if it's
-		 * currently invalid. In which case, skip adding
-		 * the RMID to the the free lru.
-		 */
-		if (!__rmid_valid(intel_cqm_rotation_rmid)) {
-			intel_cqm_rotation_rmid = entry->rmid;
-			continue;
-		}
-
-		/*
-		 * If we have groups waiting for RMIDs, hand
-		 * them one now provided they don't conflict.
-		 */
-		if (intel_cqm_sched_in_event(entry->rmid))
-			continue;
-
-		/*
-		 * Otherwise place it onto the free list.
-		 */
-		list_add_tail(&entry->list, &cqm_rmid_free_lru);
+		intel_cqm_free_rmid(entry);
 	}
 
 
@@ -872,7 +1265,16 @@ static void intel_cqm_setup_event(struct perf_event *event,
 	else
 		rmid = __get_rmid();
 
+	if (event->attr.config == QOS_L3_OCCUP_EVENT_ID) {
+		struct cqm_rmid_entry *entry;
+
+		entry = __rmid_entry(rmid);
+		entry->is_cqm = true;
+	}
+
 	event->hw.cqm_rmid = rmid;
+	if ((event->attr.config >= QOS_MBM_TOTAL_EVENT_ID) && (event->attr.config <= QOS_MBM_LOCAL_AVG_EVENT_ID))
+		rmid_read_mbm(rmid, event->attr.config);
 }
 
 static void intel_cqm_event_read(struct perf_event *event)
@@ -885,6 +1287,13 @@ static void intel_cqm_event_read(struct perf_event *event)
 	 * Task events are handled by intel_cqm_event_count().
 	 */
 	if (event->cpu == -1)
+		return;
+
+	if  ((event->attr.config >= QOS_MBM_TOTAL_EVENT_ID) &&
+	     (event->attr.config <= QOS_MBM_LOCAL_EVENT_ID))
+		intel_mbm_event_update(event);
+
+	if (event->attr.config !=  QOS_L3_OCCUP_EVENT_ID)
 		return;
 
 	raw_spin_lock_irqsave(&cache_lock, flags);
@@ -924,6 +1333,38 @@ static inline bool cqm_group_leader(struct perf_event *event)
 	return !list_empty(&event->hw.cqm_groups_entry);
 }
 
+static void mbm_stop_hrtimer(struct mbm_pmu *pmu)
+{
+	hrtimer_cancel(&pmu->hrtimer);
+}
+
+static void __intel_mbm_event_count(void *info)
+{
+	struct rmid_read *rr = info;
+	u64 val;
+
+	val = rmid_read_mbm(rr->rmid, rr->evt_type);
+	if (val & (RMID_VAL_ERROR | RMID_VAL_UNAVAIL))
+		return;
+	atomic64_add(val, &rr->value);
+}
+
+static u64 intel_mbm_event_count(struct perf_event *event, struct rmid_read *rr)
+{
+	struct mbm_pmu *pmu = __this_cpu_read(mbm_pmu);
+
+	on_each_cpu_mask(&cqm_cpumask, __intel_mbm_event_count,
+		   rr, 1);
+	if (pmu) {
+		pmu->n_active--;
+		if (pmu->n_active == 0)
+			mbm_stop_hrtimer(pmu);
+	}
+	if (event->hw.cqm_rmid == rr->rmid)
+		local64_set(&event->count, atomic64_read(&rr->value));
+	return __perf_event_count(event);
+
+}
 static u64 intel_cqm_event_count(struct perf_event *event)
 {
 	unsigned long flags;
@@ -948,8 +1389,13 @@ static u64 intel_cqm_event_count(struct perf_event *event)
 	 * specific packages - we forfeit that ability when we create
 	 * task events.
 	 */
-	if (!cqm_group_leader(event))
-		return 0;
+	if (!cqm_group_leader(event)) {
+		struct cqm_rmid_entry *entry;
+
+		entry = __rmid_entry(event->hw.cqm_rmid);
+		if (!entry->is_multi_event)
+			return 0;
+	}
 
 	/*
 	 * Getting up-to-date values requires an SMP IPI which is not
@@ -975,14 +1421,66 @@ static u64 intel_cqm_event_count(struct perf_event *event)
 	if (!__rmid_valid(rr.rmid))
 		goto out;
 
-	on_each_cpu_mask(&cqm_cpumask, __intel_cqm_event_count, &rr, 1);
+	if (event->attr.config == QOS_L3_OCCUP_EVENT_ID)
+		on_each_cpu_mask(&cqm_cpumask, __intel_cqm_event_count, &rr, 1);
 
+	if (((event->attr.config >= QOS_MBM_TOTAL_EVENT_ID) &&
+	     (event->attr.config <= QOS_MBM_LOCAL_AVG_EVENT_ID))  && (is_mbm)) {
+		rr.evt_type = event->attr.config;
+		return intel_mbm_event_count(event, &rr);
+	}
 	raw_spin_lock_irqsave(&cache_lock, flags);
 	if (event->hw.cqm_rmid == rr.rmid)
 		local64_set(&event->count, atomic64_read(&rr.value));
 	raw_spin_unlock_irqrestore(&cache_lock, flags);
 out:
 	return __perf_event_count(event);
+}
+
+static void mbm_start_hrtimer(struct mbm_pmu *pmu)
+{
+	hrtimer_start_range_ns(&(pmu->hrtimer),
+				 pmu->timer_interval, 0,
+				 HRTIMER_MODE_REL_PINNED);
+}
+
+static enum hrtimer_restart mbm_hrtimer_handle(struct hrtimer *hrtimer)
+{
+	struct mbm_pmu *pmu = __this_cpu_read(mbm_pmu);
+	struct perf_event *event;
+
+	if (!pmu->n_active)
+		return HRTIMER_NORESTART;
+	list_for_each_entry(event, &pmu->active_list, active_entry)
+		intel_mbm_event_update(event);
+	hrtimer_forward_now(hrtimer, pmu->timer_interval);
+	return HRTIMER_RESTART;
+}
+
+static void mbm_hrtimer_init(struct mbm_pmu *pmu)
+{
+	struct hrtimer *hr = &pmu->hrtimer;
+
+	hrtimer_init(hr, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	hr->function = mbm_hrtimer_handle;
+}
+
+static void intel_mbm_event_start(struct perf_event *event, int mode)
+{
+
+	if (((event->attr.config >= QOS_MBM_TOTAL_EVENT_ID) &&
+	     (event->attr.config <= QOS_MBM_LOCAL_EVENT_ID))  && (is_mbm)) {
+		struct mbm_pmu *pmu = __this_cpu_read(mbm_pmu);
+
+		if (pmu) {
+			pmu->n_active++;
+			list_add_tail(&event->active_entry,
+				      &pmu->active_list);
+			if (pmu->n_active == 1)
+				mbm_start_hrtimer(pmu);
+		}
+	}
+
 }
 
 static void intel_cqm_event_start(struct perf_event *event, int mode)
@@ -1004,6 +1502,24 @@ static void intel_cqm_event_start(struct perf_event *event, int mode)
 
 	state->rmid = rmid;
 	wrmsr(MSR_IA32_PQR_ASSOC, rmid, state->closid);
+	intel_mbm_event_start(event, mode);
+
+}
+
+static void intel_mbm_event_stop(struct perf_event *event, int mode)
+{
+	struct mbm_pmu *pmu = __this_cpu_read(mbm_pmu);
+
+	if (pmu) {
+		intel_mbm_event_update(event);
+		if ((pmu->n_active >  0) && (event->cpu != -1))
+			pmu->n_active--;
+			if (pmu->n_active == 0)
+				mbm_stop_hrtimer(pmu);
+		if (!list_empty(&event->active_entry))
+			list_del(&event->active_entry);
+	}
+
 }
 
 static void intel_cqm_event_stop(struct perf_event *event, int mode)
@@ -1015,7 +1531,12 @@ static void intel_cqm_event_stop(struct perf_event *event, int mode)
 
 	event->hw.cqm_state |= PERF_HES_STOPPED;
 
-	intel_cqm_event_read(event);
+	if (event->attr.config == QOS_L3_OCCUP_EVENT_ID)
+		intel_cqm_event_read(event);
+
+	if ((event->attr.config >= QOS_MBM_TOTAL_EVENT_ID) &&
+	    (event->attr.config <= QOS_MBM_LOCAL_EVENT_ID))
+		intel_mbm_event_update(event);
 
 	if (!--state->rmid_usecnt) {
 		state->rmid = 0;
@@ -1023,6 +1544,8 @@ static void intel_cqm_event_stop(struct perf_event *event, int mode)
 	} else {
 		WARN_ON_ONCE(!state->rmid);
 	}
+
+	intel_mbm_event_stop(event, mode);
 }
 
 static int intel_cqm_event_add(struct perf_event *event, int mode)
@@ -1090,7 +1613,8 @@ static int intel_cqm_event_init(struct perf_event *event)
 	if (event->attr.type != intel_cqm_pmu.type)
 		return -ENOENT;
 
-	if (event->attr.config & ~QOS_EVENT_MASK)
+	if ((event->attr.config < QOS_L3_OCCUP_EVENT_ID) ||
+	     (event->attr.config > QOS_MBM_LOCAL_AVG_EVENT_ID))
 		return -EINVAL;
 
 	/* unsupported modes and filters */
@@ -1145,6 +1669,35 @@ EVENT_ATTR_STR(llc_occupancy.unit, intel_cqm_llc_unit, "Bytes");
 EVENT_ATTR_STR(llc_occupancy.scale, intel_cqm_llc_scale, NULL);
 EVENT_ATTR_STR(llc_occupancy.snapshot, intel_cqm_llc_snapshot, "1");
 
+EVENT_ATTR_STR(total_bw, intel_cqm_total_bw, "event=0x02");
+EVENT_ATTR_STR(total_bw.per-pkg, intel_cqm_total_bw_pkg, "1");
+EVENT_ATTR_STR(total_bw.unit, intel_cqm_total_bw_unit, "MB/sec");
+EVENT_ATTR_STR(total_bw.scale, intel_cqm_total_bw_scale, NULL);
+EVENT_ATTR_STR(total_bw.snapshot, intel_cqm_total_bw_snapshot, "1");
+EVENT_ATTR_STR(total_bw.runavg_nosamples,
+				intel_cqm_total_bw_runavg_nosamples, "10");
+EVENT_ATTR_STR(local_bw.runavg_nosamples,
+				intel_cqm_local_bw_runavg_nosamples, "10");
+
+
+EVENT_ATTR_STR(local_bw, intel_cqm_local_bw, "event=0x03");
+EVENT_ATTR_STR(local_bw.per-pkg, intel_cqm_local_bw_pkg, "1");
+EVENT_ATTR_STR(local_bw.unit, intel_cqm_local_bw_unit, "MB/sec");
+EVENT_ATTR_STR(local_bw.scale, intel_cqm_local_bw_scale, NULL);
+EVENT_ATTR_STR(local_bw.snapshot, intel_cqm_local_bw_snapshot, "1");
+
+EVENT_ATTR_STR(avg_total_bw, intel_cqm_avg_total_bw, "event=0x04");
+EVENT_ATTR_STR(avg_total_bw.per-pkg, intel_cqm_avg_total_bw_pkg, "1");
+EVENT_ATTR_STR(avg_total_bw.unit, intel_cqm_avg_total_bw_unit, "MB/sec");
+EVENT_ATTR_STR(avg_total_bw.scale, intel_cqm_avg_total_bw_scale, NULL);
+EVENT_ATTR_STR(avg_total_bw.snapshot, intel_cqm_avg_total_bw_snapshot, "1");
+
+EVENT_ATTR_STR(avg_local_bw, intel_cqm_avg_local_bw, "event=0x05");
+EVENT_ATTR_STR(avg_local_bw.per-pkg, intel_cqm_avg_local_bw_pkg, "1");
+EVENT_ATTR_STR(avg_local_bw.unit, intel_cqm_avg_local_bw_unit, "MB/sec");
+EVENT_ATTR_STR(avg_local_bw.scale, intel_cqm_avg_local_bw_scale, NULL);
+EVENT_ATTR_STR(avg_local_bw.snapshot, intel_cqm_avg_local_bw_snapshot, "1");
+
 static struct attribute *intel_cqm_events_attr[] = {
 	EVENT_PTR(intel_cqm_llc),
 	EVENT_PTR(intel_cqm_llc_pkg),
@@ -1154,9 +1707,66 @@ static struct attribute *intel_cqm_events_attr[] = {
 	NULL,
 };
 
+static struct attribute *intel_mbm_events_attr[] = {
+	EVENT_PTR(intel_cqm_total_bw),
+	EVENT_PTR(intel_cqm_local_bw),
+	EVENT_PTR(intel_cqm_avg_total_bw),
+	EVENT_PTR(intel_cqm_avg_local_bw),
+	EVENT_PTR(intel_cqm_total_bw_pkg),
+	EVENT_PTR(intel_cqm_local_bw_pkg),
+	EVENT_PTR(intel_cqm_avg_total_bw_pkg),
+	EVENT_PTR(intel_cqm_avg_local_bw_pkg),
+	EVENT_PTR(intel_cqm_total_bw_unit),
+	EVENT_PTR(intel_cqm_local_bw_unit),
+	EVENT_PTR(intel_cqm_avg_total_bw_unit),
+	EVENT_PTR(intel_cqm_avg_local_bw_unit),
+	EVENT_PTR(intel_cqm_total_bw_scale),
+	EVENT_PTR(intel_cqm_local_bw_scale),
+	EVENT_PTR(intel_cqm_avg_total_bw_scale),
+	EVENT_PTR(intel_cqm_avg_local_bw_scale),
+	EVENT_PTR(intel_cqm_total_bw_snapshot),
+	EVENT_PTR(intel_cqm_local_bw_snapshot),
+	EVENT_PTR(intel_cqm_avg_total_bw_snapshot),
+	EVENT_PTR(intel_cqm_avg_local_bw_snapshot),
+	EVENT_PTR(intel_cqm_total_bw_runavg_nosamples),
+	EVENT_PTR(intel_cqm_local_bw_runavg_nosamples),
+	NULL,
+};
+
+static struct attribute *intel_cmt_mbm_events_attr[] = {
+	EVENT_PTR(intel_cqm_llc),
+	EVENT_PTR(intel_cqm_total_bw),
+	EVENT_PTR(intel_cqm_local_bw),
+	EVENT_PTR(intel_cqm_avg_total_bw),
+	EVENT_PTR(intel_cqm_avg_local_bw),
+	EVENT_PTR(intel_cqm_llc_pkg),
+	EVENT_PTR(intel_cqm_total_bw_pkg),
+	EVENT_PTR(intel_cqm_local_bw_pkg),
+	EVENT_PTR(intel_cqm_avg_total_bw_pkg),
+	EVENT_PTR(intel_cqm_avg_local_bw_pkg),
+	EVENT_PTR(intel_cqm_llc_unit),
+	EVENT_PTR(intel_cqm_total_bw_unit),
+	EVENT_PTR(intel_cqm_local_bw_unit),
+	EVENT_PTR(intel_cqm_avg_total_bw_unit),
+	EVENT_PTR(intel_cqm_avg_local_bw_unit),
+	EVENT_PTR(intel_cqm_llc_scale),
+	EVENT_PTR(intel_cqm_total_bw_scale),
+	EVENT_PTR(intel_cqm_local_bw_scale),
+	EVENT_PTR(intel_cqm_avg_total_bw_scale),
+	EVENT_PTR(intel_cqm_avg_local_bw_scale),
+	EVENT_PTR(intel_cqm_llc_snapshot),
+	EVENT_PTR(intel_cqm_total_bw_snapshot),
+	EVENT_PTR(intel_cqm_local_bw_snapshot),
+	EVENT_PTR(intel_cqm_avg_total_bw_snapshot),
+	EVENT_PTR(intel_cqm_avg_local_bw_snapshot),
+	EVENT_PTR(intel_cqm_total_bw_runavg_nosamples),
+	EVENT_PTR(intel_cqm_local_bw_runavg_nosamples),
+	NULL,
+};
+
 static struct attribute_group intel_cqm_events_group = {
 	.name = "events",
-	.attrs = intel_cqm_events_attr,
+	.attrs = NULL,
 };
 
 PMU_FORMAT_ATTR(event, "config:0-7");
@@ -1180,6 +1790,16 @@ max_recycle_threshold_show(struct device *dev, struct device_attribute *attr,
 	rv = snprintf(page, PAGE_SIZE-1, "%u\n", __intel_cqm_max_threshold);
 	mutex_unlock(&cache_mutex);
 
+	return rv;
+}
+
+static ssize_t
+sliding_window_size_show(struct device *dev, struct device_attribute *attr,
+		char *page)
+{
+	ssize_t rv;
+
+	rv = snprintf(page, PAGE_SIZE-1, "%u\n", mbm_window_size);
 	return rv;
 }
 
@@ -1211,10 +1831,36 @@ max_recycle_threshold_store(struct device *dev,
 	return count;
 }
 
+static ssize_t
+sliding_window_size_store(struct device *dev,
+			  struct device_attribute *attr,
+			  const char *buf, size_t count)
+{
+	unsigned int bytes;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &bytes);
+	if (ret)
+		return ret;
+
+	mutex_lock(&cache_mutex);
+	if (bytes >= MBM_FIFO_SIZE_MIN && bytes <= MBM_FIFO_SIZE_MAX)
+		mbm_window_size = bytes;
+	else {
+		mutex_unlock(&cache_mutex);
+		return -EINVAL;
+	}
+	mutex_unlock(&cache_mutex);
+
+	return count;
+}
+
 static DEVICE_ATTR_RW(max_recycle_threshold);
+static DEVICE_ATTR_RW(sliding_window_size);
 
 static struct attribute *intel_cqm_attrs[] = {
 	&dev_attr_max_recycle_threshold.attr,
+	&dev_attr_sliding_window_size.attr,
 	NULL,
 };
 
@@ -1255,7 +1901,24 @@ static inline void cqm_pick_event_reader(int cpu)
 	cpumask_set_cpu(cpu, &cqm_cpumask);
 }
 
-static void intel_cqm_cpu_starting(unsigned int cpu)
+static int intel_mbm_cpu_prepare(unsigned int cpu)
+{
+	struct mbm_pmu *pmu = per_cpu(mbm_pmu, cpu);
+
+	if ((!pmu) && (is_mbm)) {
+		pmu = kzalloc_node(sizeof(*mbm_pmu), GFP_KERNEL, NUMA_NO_NODE);
+		if (!pmu)
+			return  -ENOMEM;
+		INIT_LIST_HEAD(&pmu->active_list);
+		pmu->pmu = &intel_cqm_pmu;
+		pmu->timer_interval = ms_to_ktime(MBM_TIME_DELTA_EXP);
+		per_cpu(mbm_pmu, cpu) = pmu;
+		mbm_hrtimer_init(pmu);
+	}
+	return 0;
+}
+
+static int intel_cqm_cpu_starting(unsigned int cpu)
 {
 	struct intel_pqr_state *state = &per_cpu(pqr_state, cpu);
 	struct cpuinfo_x86 *c = &cpu_data(cpu);
@@ -1266,12 +1929,15 @@ static void intel_cqm_cpu_starting(unsigned int cpu)
 
 	WARN_ON(c->x86_cache_max_rmid != cqm_max_rmid);
 	WARN_ON(c->x86_cache_occ_scale != cqm_l3_scale);
+
+	return intel_mbm_cpu_prepare(cpu);
 }
 
 static void intel_cqm_cpu_exit(unsigned int cpu)
 {
 	int phys_id = topology_physical_package_id(cpu);
 	int i;
+	struct mbm_pmu *pmu = per_cpu(mbm_pmu, cpu);
 
 	/*
 	 * Is @cpu a designated cqm reader?
@@ -1288,19 +1954,27 @@ static void intel_cqm_cpu_exit(unsigned int cpu)
 			break;
 		}
 	}
+
+	/* cancel overflow polling timer for CPU */
+	if (pmu)
+		mbm_stop_hrtimer(pmu);
+
 }
 
 static int intel_cqm_cpu_notifier(struct notifier_block *nb,
 				  unsigned long action, void *hcpu)
 {
 	unsigned int cpu  = (unsigned long)hcpu;
+	int ret;
 
 	switch (action & ~CPU_TASKS_FROZEN) {
 	case CPU_DOWN_PREPARE:
 		intel_cqm_cpu_exit(cpu);
 		break;
 	case CPU_STARTING:
-		intel_cqm_cpu_starting(cpu);
+		ret = intel_cqm_cpu_starting(cpu);
+		if (ret)
+			return ret;
 		cqm_pick_event_reader(cpu);
 		break;
 	}
@@ -1313,12 +1987,79 @@ static const struct x86_cpu_id intel_cqm_match[] = {
 	{}
 };
 
+static const struct x86_cpu_id intel_mbm_match[] = {
+	{ .vendor = X86_VENDOR_INTEL, .feature = X86_FEATURE_CQM_MBM_LOCAL },
+	{}
+};
+
+static int  intel_mbm_init(void)
+{
+	u32 i;
+	int ret, array_size;
+	char scale[20], *str = NULL;
+
+	if (!x86_match_cpu(intel_mbm_match))
+		return -ENODEV;
+	is_mbm = true;
+	/*
+	 * MBM counter values are  in Bytes. To convert this to MBytes:
+	 * Bytes / 1.0e6 gives the MBytes.  Hardware uses upscale factor
+	 * as given by cqm_l3_scale. Muliply upscale factor by 1/1.0e6
+	 * to set the scale to get the perf output in MBytes/sec
+	 */
+
+	snprintf(scale, sizeof(scale), "%u%s", cqm_l3_scale, "e-6");
+	str = kstrdup(scale, GFP_KERNEL);
+	if (!str) {
+		is_mbm = false;
+		return -ENOMEM;
+	}
+	if (cqm_llc_occ)
+		intel_cqm_events_group.attrs =
+			  intel_cmt_mbm_events_attr;
+	else
+		intel_cqm_events_group.attrs = intel_mbm_events_attr;
+
+	for_each_possible_cpu(i) {
+		mbm_socket_max = max(mbm_socket_max,
+				     topology_physical_package_id(i));
+	}
+	mbm_socket_max++;
+
+	array_size = (cqm_max_rmid + 1) * mbm_socket_max;
+	mbm_local = kzalloc_node(sizeof(struct sample) * array_size,
+				 GFP_KERNEL, NUMA_NO_NODE);
+	if (!mbm_local) {
+		ret = -ENOMEM;
+		goto free_str;
+	}
+
+	mbm_total = kzalloc_node(sizeof(struct sample) * array_size,
+				 GFP_KERNEL, NUMA_NO_NODE);
+	if (!mbm_total) {
+		ret = -ENOMEM;
+		goto free_local;
+	}
+	event_attr_intel_cqm_local_bw_scale.event_str = str;
+	event_attr_intel_cqm_total_bw_scale.event_str = str;
+	event_attr_intel_cqm_avg_local_bw_scale.event_str = str;
+	event_attr_intel_cqm_avg_total_bw_scale.event_str = str;
+	return 0;
+free_local:
+	kfree(mbm_local);
+free_str:
+	kfree(str);
+	is_mbm = false;
+	return ret;
+}
+
 static int __init intel_cqm_init(void)
 {
-	char *str, scale[20];
-	int i, cpu, ret;
+	char *str = NULL, scale[20];
+	int i, cpu, ret = 0;
 
-	if (!x86_match_cpu(intel_cqm_match))
+	if ((!x86_match_cpu(intel_cqm_match)) &&
+	    (!x86_match_cpu(intel_mbm_match)))
 		return -ENODEV;
 
 	cqm_l3_scale = boot_cpu_data.x86_cache_occ_scale;
@@ -1346,6 +2087,9 @@ static int __init intel_cqm_init(void)
 			goto out;
 		}
 	}
+	if (x86_match_cpu(intel_cqm_match)) {
+		cqm_llc_occ = true;
+		intel_cqm_events_group.attrs = intel_cqm_events_attr;
 
 	/*
 	 * A reasonable upper limit on the max threshold is the number
@@ -1365,13 +2109,18 @@ static int __init intel_cqm_init(void)
 	}
 
 	event_attr_intel_cqm_llc_scale.event_str = str;
-
+	}
+	ret = intel_mbm_init();
+	if ((ret) && (!cqm_llc_occ))
+		goto out;
 	ret = intel_cqm_setup_rmid_cache();
 	if (ret)
 		goto out;
 
 	for_each_online_cpu(i) {
-		intel_cqm_cpu_starting(i);
+		ret = intel_cqm_cpu_starting(i);
+		if (ret)
+			goto out;
 		cqm_pick_event_reader(i);
 	}
 
@@ -1386,6 +2135,13 @@ static int __init intel_cqm_init(void)
 out:
 	cpu_notifier_register_done();
 
+	if (ret) {
+		kfree(str);
+		if (is_mbm) {
+			kfree(mbm_local);
+			kfree(mbm_total);
+		}
+	}
 	return ret;
 }
 device_initcall(intel_cqm_init);

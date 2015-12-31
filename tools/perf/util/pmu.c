@@ -141,6 +141,57 @@ error:
 	return ret;
 }
 
+static int perf_pmu__parse_runavg(struct perf_pmu_alias *alias,
+				  char *dir, char *name)
+{
+	struct stat st;
+	ssize_t sret;
+	char nosamples[128];
+	int fd, ret = -1;
+	char path[PATH_MAX];
+	const char *lc;
+
+	snprintf(path, PATH_MAX, "%s/%s.runavg_nosamples", dir, name);
+
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		return -1;
+
+	if (fstat(fd, &st) < 0)
+		goto error;
+
+	sret = read(fd, nosamples, sizeof(nosamples)-1);
+	if (sret < 0)
+		goto error;
+
+	if (nosamples[sret - 1] == '\n')
+		nosamples[sret - 1] = '\0';
+	else
+		nosamples[sret] = '\0';
+
+	/*
+	 * save current locale
+	 */
+	lc = setlocale(LC_NUMERIC, NULL);
+
+	/*
+	 * force to C locale to ensure kernel
+	 * scale string is converted correctly.
+	 * kernel uses default C locale.
+	 */
+	setlocale(LC_NUMERIC, "C");
+
+	alias->runavg_nosamples = strtod(nosamples, NULL);
+
+	/* restore locale */
+	setlocale(LC_NUMERIC, lc);
+
+	ret = 0;
+error:
+	close(fd);
+	return ret;
+}
+
 static int perf_pmu__parse_unit(struct perf_pmu_alias *alias, char *dir, char *name)
 {
 	char path[PATH_MAX];
@@ -220,6 +271,7 @@ static int __perf_pmu__new_alias(struct list_head *list, char *dir, char *name,
 	alias->scale = 1.0;
 	alias->unit[0] = '\0';
 	alias->per_pkg = false;
+	alias->runavg_nosamples = 0;
 
 	ret = parse_events_terms(&alias->terms, val);
 	if (ret) {
@@ -237,6 +289,7 @@ static int __perf_pmu__new_alias(struct list_head *list, char *dir, char *name,
 		perf_pmu__parse_scale(alias, dir, name);
 		perf_pmu__parse_per_pkg(alias, dir, name);
 		perf_pmu__parse_snapshot(alias, dir, name);
+		perf_pmu__parse_runavg(alias, dir, name);
 	}
 
 	list_add_tail(&alias->list, list);
@@ -270,6 +323,8 @@ static inline bool pmu_alias_info_file(char *name)
 	if (len > 8 && !strcmp(name + len - 8, ".per-pkg"))
 		return true;
 	if (len > 9 && !strcmp(name + len - 9, ".snapshot"))
+		return true;
+	if (len > 17 && !strcmp(name + len - 17, ".runavg_nosamples"))
 		return true;
 
 	return false;
@@ -872,6 +927,9 @@ int perf_pmu__check_alias(struct perf_pmu *pmu, struct list_head *head_terms,
 
 		if (alias->per_pkg)
 			info->per_pkg = true;
+
+		if (alias->runavg_nosamples)
+			info->runavg_nosamples = alias->runavg_nosamples;
 
 		list_del(&term->list);
 		free(term);

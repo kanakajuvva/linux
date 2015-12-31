@@ -591,6 +591,11 @@ static void print_aggr(char *prefix)
 				run += perf_counts(counter->counts, cpu, 0)->run;
 				nr++;
 			}
+
+			if ((stat_config.interval) &&
+			   (counter->runavg_nosamples > 0))
+				val = perf_evsel_run_avg(counter, val);
+
 			if (prefix)
 				fprintf(output, "%s", prefix);
 
@@ -672,6 +677,9 @@ static void print_counter_aggr(struct perf_evsel *counter, char *prefix)
 	int scaled = counter->counts->scaled;
 	double uval;
 	double avg_enabled, avg_running;
+
+	if ((stat_config.interval) && (counter->runavg_nosamples > 0))
+		avg = perf_evsel_run_avg(counter, avg);
 
 	avg_enabled = avg_stats(&ps->res_stats[1]);
 	avg_running = avg_stats(&ps->res_stats[2]);

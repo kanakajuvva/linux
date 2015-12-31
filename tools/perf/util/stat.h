@@ -88,6 +88,9 @@ int perf_evlist__alloc_stats(struct perf_evlist *evlist, bool alloc_raw);
 void perf_evlist__free_stats(struct perf_evlist *evlist);
 void perf_evlist__reset_stats(struct perf_evlist *evlist);
 
+int perf_evsel__alloc_rafifo(struct perf_evsel *evsel);
+void perf_evsel__free_rafifo(struct perf_evsel *evsel);
+u64 perf_evsel_run_avg(struct perf_evsel *evsel, u64 current);
 int perf_stat_process_counter(struct perf_stat_config *config,
 			      struct perf_evsel *counter);
 #endif

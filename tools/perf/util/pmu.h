@@ -32,6 +32,7 @@ struct perf_pmu_info {
 	double scale;
 	bool per_pkg;
 	bool snapshot;
+	double runavg_nosamples;
 };
 
 #define UNIT_MAX_LEN	31 /* max length for event unit name */
@@ -44,6 +45,7 @@ struct perf_pmu_alias {
 	double scale;
 	bool per_pkg;
 	bool snapshot;
+	double runavg_nosamples;
 };
 
 struct perf_pmu *perf_pmu__find(const char *name);
