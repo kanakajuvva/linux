@@ -318,7 +318,6 @@ static void mbm_reset_stats(u32 rmid)
 		memset(&mbm_local[vrmid], 0, sizeof(struct sample));
 		memset(&mbm_total[vrmid], 0, sizeof(struct sample));
 	}
-
 }
 
 /*
