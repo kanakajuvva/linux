@@ -762,7 +762,7 @@ static void mbm_fifo_in(struct sample *bw_stat, u32 val)
  */
 static u64 rmid_read_mbm(unsigned int rmid, enum mbm_evt_type evt_type)
 {
-	u64  val, currentmsr, currentbw, bytes, prevavg;
+	u32  val, currentmsr, currentbw, bytes, prevavg;
 	bool overflow = false, first = false;
 	ktime_t cur_time;
 	u32 eventid, index, diff_time;
